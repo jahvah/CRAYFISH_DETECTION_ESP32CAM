@@ -1,0 +1,51 @@
+#define WIFI_SSID "Elijah"
+#define WIFI_PASS "12345678"
+#define HOSTNAME "esp32cam"
+
+#include <eloquent_esp32cam.h>
+#include <eloquent_esp32cam/extra/esp32/wifi/sta.h>
+#include <eloquent_esp32cam/viz/image_collection.h>
+
+using eloq::camera;
+using eloq::wifi;
+using eloq::viz::collectionServer;
+
+void setup() {
+  delay(3000);
+  Serial.begin(115200);
+  Serial.println("___ESP32-S3 CAM IMAGE COLLECTION SERVER___");
+
+  // === Camera Settings ===
+  camera.pinout.wroom_s3();    // Use predefined WROOM_S3 pinout
+  camera.brownout.disable();   // Disable brownout for testing
+  camera.resolution.qvga();    // 320x240
+  camera.quality.low();        // Low quality for stability
+
+  // === Initialize Camera ===
+  while (!camera.begin().isOk()) {
+    Serial.println(camera.exception.toString());
+    delay(1000);
+  }
+
+  // === Connect to WiFi ===
+  while (!wifi.connect().isOk()) {
+    Serial.println(wifi.exception.toString());
+    delay(1000);
+  }
+
+  // === Start Image Collection Server ===
+  while (!collectionServer.begin().isOk()) {
+    Serial.println(collectionServer.exception.toString());
+    delay(1000);
+  }
+
+  Serial.println("Camera OK");
+  Serial.println("WiFi OK");
+  Serial.println("Image Collection Server OK");
+  Serial.print("Access server at: http://");
+  Serial.println(collectionServer.address());
+}
+
+void loop() {
+  // Server runs in background
+}

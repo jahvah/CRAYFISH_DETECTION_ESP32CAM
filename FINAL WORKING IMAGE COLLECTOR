@@ -1,0 +1,53 @@
+#define WIFI_SSID "SOC"
+#define WIFI_PASS "$2a$12$lL4NJJ8NSD4abIEJqk.Hne5ALlj8Al8oPbp7meFW8ihH0PrPajbAS"
+#define HOSTNAME "esp32cam"
+
+#include <eloquent_esp32cam.h>
+#include <eloquent_esp32cam/extra/esp32/wifi/sta.h>
+#include <eloquent_esp32cam/viz/image_collection.h>
+
+using eloq::camera;
+using eloq::wifi;
+using eloq::viz::collectionServer;
+
+void setup() {
+  delay(3000);
+  Serial.begin(115200);
+  Serial.println("___ESP32-S3 CAM IMAGE COLLECTION SERVER (NO ZOOM MATCH PREVIEW)___");
+
+  // Camera settings
+  camera.pinout.wroom_s3();
+  camera.brownout.disable();
+
+  // Use QVGA to avoid sensor crop zoom
+  camera.resolution.qvga();   // 320x240 (matches preview, no crop)
+  camera.quality.set(10);     // High JPEG quality
+
+  // Initialize camera
+  while (!camera.begin().isOk()) {
+    Serial.println(camera.exception.toString());
+    delay(1000);
+  }
+
+  // Connect WiFi
+  while (!wifi.connect().isOk()) {
+    Serial.println(wifi.exception.toString());
+    delay(1000);
+  }
+
+  // Start image collection server
+  while (!collectionServer.begin().isOk()) {
+    Serial.println(collectionServer.exception.toString());
+    delay(1000);
+  }
+
+  Serial.println("Camera OK");
+  Serial.println("WiFi OK");
+  Serial.println("Image Collection Server OK");
+  Serial.print("Access server at: http://");
+  Serial.println(collectionServer.address());
+}
+
+void loop() {
+  // Server runs in background
+}

@@ -1,0 +1,328 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+#include <ESP32PWM.h>
+#include <HardwareSerial.h>
+#include <WiFiClientSecure.h>
+
+#define CAMERA_MODEL_ESP32S3_EYE
+#include "camera_pins.h"
+
+// ================= WIFI =================
+const char *ssid = "Elijah";
+const char *password = "ElijahGallardo";
+
+// ================= SERVER =================
+const char* serverIP = "10.117.80.7";
+const int serverPort = 5000;
+const char* cameraUploadUrl = "http://10.117.80.7:5000/upload";
+
+// ================= SERVO =================
+Servo servoMotor;
+const int servoPin = 20;
+const int SMALL_DURATION = 500;
+const int BIG_DURATION = 2000;
+const int SERVO_CLOSE = 0;
+const int SERVO_OPEN = 180;
+
+// ================= TELEGRAM =================
+const String botToken = "8707550452:AAE0Qam9zuAxV8HjdUFmEDiYV0XHUNrMXnE";
+const String chatID = "5146801038";
+unsigned long lastTelegramSent = 0;
+const int TELEGRAM_COOLDOWN = 20000; // 20 sec
+
+void sendTelegram(String message) {
+  if (millis() - lastTelegramSent < TELEGRAM_COOLDOWN) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatID + "&text=" + message;
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+  http.end();
+
+  if (httpCode > 0) Serial.println("Telegram sent! Code: " + String(httpCode));
+  else Serial.println("Telegram failed: " + String(httpCode));
+
+  lastTelegramSent = millis();
+}
+
+// ================= PH SENSOR =================
+#define PH_PIN 2
+#define PUMP_PIN 21
+#define PH_LOW 6.5
+#define PH_HIGH 7.5
+#define DOSING_TIME 30000
+const unsigned long PUMP_COOLDOWN_MS = 30000;
+
+int RAW_NEUTRAL = 2095;
+float PH_NEUTRAL = 7.0;
+int RAW_ACID = 2450;
+float PH_ACID = 4.0;
+float pH_slope;
+float pH_intercept;
+
+bool pumpRunning = false;
+unsigned long pumpStartTime = 0;
+unsigned long lastPumpTime = 0;
+
+// ================= CAMERA =================
+unsigned long lastCameraCapture = 0;
+const int CAMERA_INTERVAL = 5000;
+
+// ================= DETECTION =================
+unsigned long lastDetectPoll = 0;
+
+const int DETECT_INTERVAL = 5000;
+
+// ================= SERVO =================
+unsigned long lastServoAction = 0;
+bool servoActive = false;
+unsigned long servoStartTime = 0;
+unsigned long servoDuration = 0;
+
+// ================= CAMERA INIT =================
+void initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_VGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  if (!psramFound()) config.fb_location = CAMERA_FB_IN_DRAM;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed");
+    delay(5000);
+    ESP.restart();
+  }
+  Serial.println("Camera init OK");
+}
+
+// ================= WIFI =================
+void connectToWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi Connected! IP: " + WiFi.localIP().toString());
+  } else Serial.println("WiFi FAILED");
+}
+
+// ================= SERVER DETECTION =================
+String getDetectionFromServer() {
+  HTTPClient http;
+  String url = String("http://") + serverIP + ":" + serverPort + "/api/detect";
+  http.begin(url);
+  int httpCode = http.GET();
+  String sizeCategory = "";
+  if (httpCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    int idx = response.indexOf("\"size_category\"");
+    if (idx != -1) {
+      int colon = response.indexOf(":", idx);
+      int q1 = response.indexOf("\"", colon + 1);
+      int q2 = response.indexOf("\"", q1 + 1);
+      sizeCategory = response.substring(q1 + 1, q2);
+    }
+  }
+  http.end();
+  return sizeCategory;
+}
+
+String getEggDetectionFromServer() {
+  HTTPClient http;
+  String url = String("http://") + serverIP + ":" + serverPort + "/api/detect_eggs";
+  http.begin(url);
+  int httpCode = http.GET();
+  String eggStatus = "";
+  if (httpCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    int idx = response.indexOf("\"status\"");
+    if (idx != -1) {
+      int colon = response.indexOf(":", idx);
+      int q1 = response.indexOf("\"", colon + 1);
+      int q2 = response.indexOf("\"", q1 + 1);
+      eggStatus = response.substring(q1 + 1, q2);
+    }
+  }
+  http.end();
+  return eggStatus;
+}
+
+// ================= SEND PHOTO =================
+void sendPhotoToServer() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  HTTPClient http;
+  http.begin(cameraUploadUrl);
+  http.addHeader("Content-Type", "image/jpeg");
+  http.POST(fb->buf, fb->len);
+  http.end();
+  esp_camera_fb_return(fb);
+}
+
+// ================= SERVO =================
+void startServo(String sizeCategory) {
+  servoActive = true;
+  servoStartTime = millis();
+  if (sizeCategory == "SMALL") servoDuration = SMALL_DURATION;
+  else if (sizeCategory == "BIG") servoDuration = BIG_DURATION;
+  else servoDuration = 1000;
+  servoMotor.write(SERVO_OPEN);
+}
+
+void updateServo() {
+  if (servoActive && millis() - servoStartTime >= servoDuration) {
+    servoMotor.write(SERVO_CLOSE);
+    servoActive = false;
+    lastServoAction = millis();
+  }
+}
+
+// ================= PH =================
+void readPH() {
+  long sum = 0;
+  for(int i=0; i<50; i++) sum += analogRead(PH_PIN);
+  int rawPh = sum / 50;
+  float ph = (pH_slope * rawPh) + pH_intercept;
+
+  String pumpState = digitalRead(PUMP_PIN) == LOW ? "ON" : "OFF"; // active LOW relay
+
+  // ----- WATER STATE -----
+  String waterState = "ok";
+
+  if(ph < PH_LOW){
+    waterState = "Acidic";
+  }
+  else if(ph > PH_HIGH){
+    waterState = "Basic";
+  }
+  else{
+    waterState = "Neutral";
+  }
+
+  // ----- PUMP CONTROL -----
+  if(ph < PH_LOW && !pumpRunning && millis() - lastPumpTime >= PUMP_COOLDOWN_MS) {
+    digitalWrite(PUMP_PIN, LOW);  // ON
+    pumpRunning = true;
+    pumpStartTime = millis();
+    Serial.println("Pump STARTED via relay");
+  }
+
+  if(pumpRunning && millis() - pumpStartTime >= DOSING_TIME) {
+    digitalWrite(PUMP_PIN, HIGH); // OFF
+    pumpRunning = false;
+    lastPumpTime = millis();
+    Serial.println("Pump STOPPED via relay");
+  }
+
+  Serial.println("pH: " + String(ph,2) + 
+                 " | Raw: " + String(rawPh) + 
+                 " | Water: " + waterState +
+                 " | Pump: " + pumpState);
+
+  // ----- SEND TO SERVER -----
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String("http://") + serverIP + ":" + serverPort + "/api/ph";
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"ph\":" + String(ph,2) +
+                     ",\"raw\":" + String(rawPh) +
+                     ",\"water_state\":/" + waterState +
+                     "\",\"pump_state\":/" + pumpState + "\"}";
+
+    http.POST(payload);
+    http.end();
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, HIGH); // OFF (active LOW)
+  Serial.begin(115200);
+  delay(2000);
+
+  initCamera();
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  pH_slope = (PH_ACID - PH_NEUTRAL) / (float)(RAW_ACID - RAW_NEUTRAL);
+  pH_intercept = PH_NEUTRAL - (pH_slope * RAW_NEUTRAL);
+  Serial.println("pH Calibration Ready");
+
+  ESP32PWM::allocateTimer(1);
+  servoMotor.setPeriodHertz(50);
+  servoMotor.attach(servoPin, 1000, 2000);
+  servoMotor.write(SERVO_CLOSE);
+
+  connectToWiFi();
+}
+
+// ================= LOOP =================
+void loop() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+
+  // Camera capture
+  if (now - lastCameraCapture >= CAMERA_INTERVAL) {
+    lastCameraCapture = now;
+    sendPhotoToServer();
+    Serial.println("Photo sent to server");
+  }
+
+  // Poll detection
+  if (now - lastDetectPoll >= DETECT_INTERVAL) {
+    lastDetectPoll = now;
+    String sizeCategory = getDetectionFromServer();
+    String eggStatus = getEggDetectionFromServer();
+    Serial.println("Size: " + sizeCategory + " | Egg: " + eggStatus);
+
+    if (sizeCategory != "" && !servoActive) startServo(sizeCategory);
+    if (eggStatus == "detected") sendTelegram("⚠️ Egg Detected in Crayfish Tank!");
+  }
+
+  updateServo();
+  readPH();
+}
